@@ -1,4 +1,4 @@
-```python
+
 import os
 import json
 import hashlib
@@ -558,4 +558,3 @@ QUESTION:
     with st.chat_message("assistant"):
 
         st.write(answer)
-```
