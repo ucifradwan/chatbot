@@ -1,6 +1,7 @@
 ```python
 import os
 import json
+import hashlib
 import numpy as np
 import streamlit as st
 
@@ -38,6 +39,14 @@ EMBEDDING_MODEL = "gemini-embedding-001"
 
 
 # =========================================================
+# PATHS
+# =========================================================
+
+KNOWLEDGE_FOLDER = "knowledge"
+CACHE_FILE = "rag_cache.json"
+
+
+# =========================================================
 # FILE READING
 # =========================================================
 
@@ -47,11 +56,15 @@ def read_pdf(path):
 
     pages = []
 
-    for page_number, page in enumerate(reader.pages, start=1):
+    for page_number, page in enumerate(
+        reader.pages,
+        start=1
+    ):
 
         text = page.extract_text() or ""
 
         if text.strip():
+
             pages.append(
                 f"[Page {page_number}]\n{text}"
             )
@@ -72,7 +85,12 @@ def read_docx(path):
 
 def read_txt(path):
 
-    with open(path, "r", encoding="utf-8") as file:
+    with open(
+        path,
+        "r",
+        encoding="utf-8"
+    ) as file:
+
         return file.read()
 
 
@@ -93,10 +111,36 @@ def read_file(path):
 
 
 # =========================================================
+# FILE HASH
+# =========================================================
+
+def get_file_hash(path):
+
+    hasher = hashlib.sha256()
+
+    with open(path, "rb") as file:
+
+        while True:
+
+            data = file.read(1024 * 1024)
+
+            if not data:
+                break
+
+            hasher.update(data)
+
+    return hasher.hexdigest()
+
+
+# =========================================================
 # CHUNKING
 # =========================================================
 
-def split_text(text, chunk_size=1200, overlap=200):
+def split_text(
+    text,
+    chunk_size=1200,
+    overlap=200
+):
 
     text = text.strip()
 
@@ -111,6 +155,7 @@ def split_text(text, chunk_size=1200, overlap=200):
         chunk = text[start:end].strip()
 
         if chunk:
+
             chunks.append(chunk)
 
         start += chunk_size - overlap
@@ -119,127 +164,251 @@ def split_text(text, chunk_size=1200, overlap=200):
 
 
 # =========================================================
-# CREATE KNOWLEDGE BASE
+# CACHE
 # =========================================================
 
-@st.cache_data(show_spinner="جاري تجهيز قاعدة المعرفة...")
+def load_cache():
+
+    if not os.path.exists(CACHE_FILE):
+
+        return {}
+
+    try:
+
+        with open(
+            CACHE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            return json.load(file)
+
+    except Exception:
+
+        return {}
+
+
+def save_cache(cache):
+
+    with open(
+        CACHE_FILE,
+        "w",
+        encoding="utf-8"
+    ) as file:
+
+        json.dump(
+            cache,
+            file,
+            ensure_ascii=False
+        )
+
+
+# =========================================================
+# BUILD / UPDATE KNOWLEDGE
+# =========================================================
+
 def build_knowledge():
 
-    folder = "knowledge"
+    cache = load_cache()
+
+    current_files = {}
 
     all_chunks = []
 
-    if not os.path.exists(folder):
-        return []
+    if not os.path.exists(
+        KNOWLEDGE_FOLDER
+    ):
 
-    for filename in sorted(os.listdir(folder)):
+        return [], np.array([])
 
-        path = os.path.join(folder, filename)
+    # -----------------------------------------
+    # Read current files
+    # -----------------------------------------
+
+    for filename in sorted(
+        os.listdir(KNOWLEDGE_FOLDER)
+    ):
+
+        path = os.path.join(
+            KNOWLEDGE_FOLDER,
+            filename
+        )
 
         if not filename.lower().endswith(
             (".pdf", ".docx", ".txt")
         ):
             continue
 
+        file_hash = get_file_hash(path)
+
+        current_files[filename] = file_hash
+
+        # -------------------------------------
+        # File unchanged
+        # -------------------------------------
+
+        if (
+            filename in cache
+            and cache[filename].get("hash")
+            == file_hash
+        ):
+
+            file_data = cache[filename]
+
+            all_chunks.extend(
+                file_data["chunks"]
+            )
+
+            continue
+
+        # -------------------------------------
+        # File changed / new
+        # -------------------------------------
+
         text = read_file(path)
 
         if not text.strip():
+
             continue
 
         chunks = split_text(text)
 
-        for chunk_number, chunk in enumerate(chunks):
-
-            all_chunks.append({
-                "text": chunk,
-                "filename": filename,
-                "chunk": chunk_number
-            })
-
-    return all_chunks
-
-
-chunks = build_knowledge()
-
-
-# =========================================================
-# CREATE EMBEDDINGS
-# =========================================================
-
-@st.cache_resource(show_spinner="جاري إنشاء الـ Embeddings...")
-def create_embeddings(chunks_data):
-
-    if not chunks_data:
-        return np.array([])
-
-    embeddings = []
-
-    batch_size = 20
-
-    for i in range(0, len(chunks_data), batch_size):
-
-        batch = chunks_data[i:i + batch_size]
-
         texts = [
-            item["text"]
-            for item in batch
+            chunk
+            for chunk in chunks
         ]
 
-        result = client.models.embed_content(
-            model=EMBEDDING_MODEL,
-            contents=texts,
-            config=types.EmbedContentConfig(
-                task_type="RETRIEVAL_DOCUMENT"
+        embeddings = []
+
+        # -------------------------------------
+        # Create embeddings in batches
+        # -------------------------------------
+
+        batch_size = 20
+
+        for i in range(
+            0,
+            len(texts),
+            batch_size
+        ):
+
+            batch = texts[
+                i:i + batch_size
+            ]
+
+            result = client.models.embed_content(
+                model=EMBEDDING_MODEL,
+                contents=batch,
+                config=types.EmbedContentConfig(
+                    task_type="RETRIEVAL_DOCUMENT"
+                )
             )
+
+            for embedding in result.embeddings:
+
+                embeddings.append(
+                    embedding.values
+                )
+
+        file_chunks = []
+
+        for index, chunk in enumerate(
+            chunks
+        ):
+
+            file_chunks.append({
+                "text": chunk,
+                "filename": filename,
+                "chunk": index,
+                "embedding": embeddings[index]
+            })
+
+        cache[filename] = {
+            "hash": file_hash,
+            "chunks": file_chunks
+        }
+
+        all_chunks.extend(
+            file_chunks
         )
 
-        for embedding in result.embeddings:
-            embeddings.append(embedding.values)
+    # -----------------------------------------
+    # Remove deleted files
+    # -----------------------------------------
 
-    return np.array(embeddings, dtype=np.float32)
+    deleted_files = [
+        filename
+        for filename in cache
+        if filename not in current_files
+    ]
 
+    for filename in deleted_files:
 
-if chunks:
+        del cache[filename]
 
-    embeddings = create_embeddings(chunks)
+    save_cache(cache)
 
-else:
+    # -----------------------------------------
+    # Build embedding matrix
+    # -----------------------------------------
 
-    embeddings = np.array([])
+    if not all_chunks:
 
+        return [], np.array([])
 
-# =========================================================
-# NORMALIZE
-# =========================================================
-
-def normalize_vectors(vectors):
-
-    if len(vectors) == 0:
-        return vectors
-
-    norms = np.linalg.norm(
-        vectors,
-        axis=1,
-        keepdims=True
+    matrix = np.array(
+        [
+            item["embedding"]
+            for item in all_chunks
+        ],
+        dtype=np.float32
     )
 
-    norms[norms == 0] = 1
-
-    return vectors / norms
+    return all_chunks, matrix
 
 
-if len(embeddings) > 0:
+# =========================================================
+# LOAD KNOWLEDGE
+# =========================================================
 
-    embeddings = normalize_vectors(embeddings)
+@st.cache_resource(
+    show_spinner="جاري تجهيز قاعدة المعرفة..."
+)
+def load_knowledge():
+
+    chunks, embeddings = build_knowledge()
+
+    if len(embeddings) > 0:
+
+        norms = np.linalg.norm(
+            embeddings,
+            axis=1,
+            keepdims=True
+        )
+
+        norms[norms == 0] = 1
+
+        embeddings = (
+            embeddings / norms
+        )
+
+    return chunks, embeddings
+
+
+chunks, embeddings = load_knowledge()
 
 
 # =========================================================
 # SEARCH
 # =========================================================
 
-def search_knowledge(question, top_k=5):
+def search_knowledge(
+    question,
+    top_k=5
+):
 
     if len(embeddings) == 0:
+
         return []
 
     result = client.models.embed_content(
@@ -255,16 +424,21 @@ def search_knowledge(question, top_k=5):
         dtype=np.float32
     )
 
-    query_norm = np.linalg.norm(query_vector)
+    norm = np.linalg.norm(
+        query_vector
+    )
 
-    if query_norm == 0:
+    if norm == 0:
+
         return []
 
-    query_vector = query_vector / query_norm
+    query_vector /= norm
 
     scores = embeddings @ query_vector
 
-    top_indices = np.argsort(scores)[::-1][:top_k]
+    top_indices = np.argsort(
+        scores
+    )[::-1][:top_k]
 
     results = []
 
@@ -273,7 +447,9 @@ def search_knowledge(question, top_k=5):
         results.append({
             "text": chunks[index]["text"],
             "filename": chunks[index]["filename"],
-            "score": float(scores[index])
+            "score": float(
+                scores[index]
+            )
         })
 
     return results
@@ -291,6 +467,7 @@ question = st.chat_input(
 if question:
 
     with st.chat_message("user"):
+
         st.write(question)
 
     if not chunks:
@@ -306,10 +483,6 @@ if question:
             top_k=5
         )
 
-        # ---------------------------------------------
-        # Minimum relevance check
-        # ---------------------------------------------
-
         if not retrieved:
 
             answer = (
@@ -320,6 +493,10 @@ if question:
         else:
 
             best_score = retrieved[0]["score"]
+
+            # ---------------------------------
+            # Relevance threshold
+            # ---------------------------------
 
             if best_score < 0.25:
 
@@ -347,26 +524,26 @@ SOURCE: {item["filename"]}
                 )
 
                 prompt = f"""
-أنت مساعد ذكي يعتمد فقط على المعلومات
-الموجودة في المصادر التي يتم إعطاؤها لك.
+أنت مساعد يعتمد فقط على المعلومات
+الموجودة في المصادر التالية.
 
 القواعد:
 
-1. أجب فقط من المعلومات الموجودة في SOURCES.
-2. لا تستخدم معلوماتك العامة للإجابة.
-3. لا تخترع أي معلومة.
-4. إذا كانت المصادر لا تحتوي على إجابة واضحة،
-   قل:
-   "المعلومة دي غير موجودة في الملفات المتاحة."
-5. أجب باللغة العربية.
-6. اجعل الإجابة واضحة ومباشرة.
-7. لا تذكر للمستخدم تفاصيل تقنية عن الـRAG.
+- أجب فقط من المصادر.
+- لا تخترع معلومات.
+- لا تستخدم معرفتك العامة.
+- إذا لم تجد الإجابة بوضوح في المصادر،
+  قل:
+  "المعلومة دي غير موجودة في الملفات المتاحة."
+- أجب بالعربية.
+- كن واضحًا ومباشرًا.
+- لا تذكر تفاصيل تقنية عن النظام.
 
 SOURCES:
 
 {context}
 
-USER QUESTION:
+QUESTION:
 
 {question}
 """
@@ -379,5 +556,6 @@ USER QUESTION:
                 answer = response.text
 
     with st.chat_message("assistant"):
+
         st.write(answer)
 ```
