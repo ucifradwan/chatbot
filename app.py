@@ -17,12 +17,12 @@ from docx import Document
 # =========================================================
 
 st.set_page_config(
-    page_title="Knowledge Chatbot",
+    page_title="Like It Chatbot",
     page_icon="🤖",
     layout="centered"
 )
 
-st.title("🤖 Knowledge Chatbot")
+st.title("🤖 Like It Chatbot")
 st.caption("اسأل عن المعلومات الموجودة في الملفات")
 
 
