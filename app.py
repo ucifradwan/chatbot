@@ -1,4 +1,3 @@
-
 import os
 import json
 import hashlib
@@ -17,13 +16,13 @@ from docx import Document
 # =========================================================
 
 st.set_page_config(
-    page_title="Like It Chatbot",
-    page_icon="🤖",
+    page_title="Like It in English AI Tutor",
+    page_icon="📚",
     layout="centered"
 )
 
-st.title("🤖 Like It Chatbot")
-st.caption("اسأل عن المعلومات الموجودة في الملفات")
+st.title("📚 Like It in English AI Tutor")
+st.caption("Your personal English learning assistant")
 
 
 # =========================================================
@@ -39,7 +38,7 @@ EMBEDDING_MODEL = "gemini-embedding-001"
 
 
 # =========================================================
-# PATHS
+# FILES
 # =========================================================
 
 KNOWLEDGE_FOLDER = "knowledge"
@@ -47,7 +46,7 @@ CACHE_FILE = "rag_cache.json"
 
 
 # =========================================================
-# FILE READING
+# READ PDF
 # =========================================================
 
 def read_pdf(path):
@@ -72,6 +71,10 @@ def read_pdf(path):
     return "\n\n".join(pages)
 
 
+# =========================================================
+# READ DOCX
+# =========================================================
+
 def read_docx(path):
 
     document = Document(path)
@@ -83,6 +86,10 @@ def read_docx(path):
     )
 
 
+# =========================================================
+# READ TXT
+# =========================================================
+
 def read_txt(path):
 
     with open(
@@ -93,6 +100,10 @@ def read_txt(path):
 
         return file.read()
 
+
+# =========================================================
+# READ FILE
+# =========================================================
 
 def read_file(path):
 
@@ -155,7 +166,6 @@ def split_text(
         chunk = text[start:end].strip()
 
         if chunk:
-
             chunks.append(chunk)
 
         start += chunk_size - overlap
@@ -170,7 +180,6 @@ def split_text(
 def load_cache():
 
     if not os.path.exists(CACHE_FILE):
-
         return {}
 
     try:
@@ -204,7 +213,7 @@ def save_cache(cache):
 
 
 # =========================================================
-# BUILD / UPDATE KNOWLEDGE
+# BUILD KNOWLEDGE BASE
 # =========================================================
 
 def build_knowledge():
@@ -215,15 +224,9 @@ def build_knowledge():
 
     all_chunks = []
 
-    if not os.path.exists(
-        KNOWLEDGE_FOLDER
-    ):
+    if not os.path.exists(KNOWLEDGE_FOLDER):
 
         return [], np.array([])
-
-    # -----------------------------------------
-    # Read current files
-    # -----------------------------------------
 
     for filename in sorted(
         os.listdir(KNOWLEDGE_FOLDER)
@@ -243,9 +246,9 @@ def build_knowledge():
 
         current_files[filename] = file_hash
 
-        # -------------------------------------
-        # File unchanged
-        # -------------------------------------
+        # -----------------------------------------
+        # File did not change
+        # -----------------------------------------
 
         if (
             filename in cache
@@ -253,46 +256,34 @@ def build_knowledge():
             == file_hash
         ):
 
-            file_data = cache[filename]
-
             all_chunks.extend(
-                file_data["chunks"]
+                cache[filename]["chunks"]
             )
 
             continue
 
-        # -------------------------------------
-        # File changed / new
-        # -------------------------------------
+        # -----------------------------------------
+        # New or changed file
+        # -----------------------------------------
 
         text = read_file(path)
 
         if not text.strip():
-
             continue
 
         chunks = split_text(text)
 
-        texts = [
-            chunk
-            for chunk in chunks
-        ]
-
         embeddings = []
-
-        # -------------------------------------
-        # Create embeddings in batches
-        # -------------------------------------
 
         batch_size = 20
 
         for i in range(
             0,
-            len(texts),
+            len(chunks),
             batch_size
         ):
 
-            batch = texts[
+            batch = chunks[
                 i:i + batch_size
             ]
 
@@ -312,20 +303,26 @@ def build_knowledge():
 
         file_chunks = []
 
-        for index, chunk in enumerate(
-            chunks
-        ):
+        for index, chunk in enumerate(chunks):
 
             file_chunks.append({
+
                 "text": chunk,
+
                 "filename": filename,
+
                 "chunk": index,
+
                 "embedding": embeddings[index]
+
             })
 
         cache[filename] = {
+
             "hash": file_hash,
+
             "chunks": file_chunks
+
         }
 
         all_chunks.extend(
@@ -337,9 +334,13 @@ def build_knowledge():
     # -----------------------------------------
 
     deleted_files = [
+
         filename
+
         for filename in cache
+
         if filename not in current_files
+
     ]
 
     for filename in deleted_files:
@@ -349,7 +350,7 @@ def build_knowledge():
     save_cache(cache)
 
     # -----------------------------------------
-    # Build embedding matrix
+    # Embedding matrix
     # -----------------------------------------
 
     if not all_chunks:
@@ -357,11 +358,14 @@ def build_knowledge():
         return [], np.array([])
 
     matrix = np.array(
+
         [
             item["embedding"]
             for item in all_chunks
         ],
+
         dtype=np.float32
+
     )
 
     return all_chunks, matrix
@@ -372,7 +376,7 @@ def build_knowledge():
 # =========================================================
 
 @st.cache_resource(
-    show_spinner="جاري تجهيز قاعدة المعرفة..."
+    show_spinner="Preparing English knowledge base..."
 )
 def load_knowledge():
 
@@ -399,29 +403,34 @@ chunks, embeddings = load_knowledge()
 
 
 # =========================================================
-# SEARCH
+# SEMANTIC SEARCH
 # =========================================================
 
 def search_knowledge(
     question,
-    top_k=5
+    top_k=6
 ):
 
     if len(embeddings) == 0:
-
         return []
 
     result = client.models.embed_content(
+
         model=EMBEDDING_MODEL,
+
         contents=question,
+
         config=types.EmbedContentConfig(
             task_type="RETRIEVAL_QUERY"
         )
     )
 
     query_vector = np.array(
+
         result.embeddings[0].values,
+
         dtype=np.float32
+
     )
 
     norm = np.linalg.norm(
@@ -429,7 +438,6 @@ def search_knowledge(
     )
 
     if norm == 0:
-
         return []
 
     query_vector /= norm
@@ -445,116 +453,401 @@ def search_knowledge(
     for index in top_indices:
 
         results.append({
-            "text": chunks[index]["text"],
-            "filename": chunks[index]["filename"],
-            "score": float(
-                scores[index]
-            )
+
+            "text":
+                chunks[index]["text"],
+
+            "filename":
+                chunks[index]["filename"],
+
+            "score":
+                float(scores[index])
+
         })
 
     return results
 
 
 # =========================================================
-# CHAT
+# CHAT HISTORY
+# =========================================================
+
+if "messages" not in st.session_state:
+
+    st.session_state.messages = []
+
+
+for message in st.session_state.messages:
+
+    with st.chat_message(
+        message["role"]
+    ):
+
+        st.write(
+            message["content"]
+        )
+
+
+# =========================================================
+# USER QUESTION
 # =========================================================
 
 question = st.chat_input(
-    "اكتب سؤالك هنا..."
+    "Ask me anything about English..."
 )
 
 
 if question:
 
+    # -----------------------------------------
+    # Display user question
+    # -----------------------------------------
+
     with st.chat_message("user"):
 
         st.write(question)
 
-    if not chunks:
+    st.session_state.messages.append({
 
-        answer = (
-            "لا توجد ملفات معرفة مضافة حاليًا."
-        )
+        "role": "user",
 
-    else:
+        "content": question
 
-        retrieved = search_knowledge(
-            question,
-            top_k=5
-        )
+    })
 
-        if not retrieved:
 
-            answer = (
-                "المعلومة دي غير موجودة "
-                "في الملفات المتاحة."
-            )
+    # =====================================================
+    # SEARCH FILES
+    # =====================================================
 
-        else:
+    retrieved = search_knowledge(
+        question,
+        top_k=6
+    )
 
-            best_score = retrieved[0]["score"]
 
-            # ---------------------------------
-            # Relevance threshold
-            # ---------------------------------
+    # =====================================================
+    # BUILD CONTEXT
+    # =====================================================
 
-            if best_score < 0.25:
+    context_parts = []
 
-                answer = (
-                    "المعلومة دي غير موجودة "
-                    "في الملفات المتاحة."
-                )
+    for item in retrieved:
 
-            else:
+        context_parts.append(
 
-                context_parts = []
-
-                for item in retrieved:
-
-                    context_parts.append(
-                        f"""
-SOURCE: {item["filename"]}
+            f"""
+SOURCE FILE: {item["filename"]}
 
 {item["text"]}
 """
-                    )
 
-                context = "\n\n".join(
-                    context_parts
-                )
+        )
 
-                prompt = f"""
-أنت مساعد يعتمد فقط على المعلومات
-الموجودة في المصادر التالية.
+    context = "\n\n".join(
+        context_parts
+    )
 
-القواعد:
 
-- أجب فقط من المصادر.
-- لا تخترع معلومات.
-- لا تستخدم معرفتك العامة.
-- إذا لم تجد الإجابة بوضوح في المصادر،
-  قل:
-  "المعلومة دي غير موجودة في الملفات المتاحة."
-- أجب بالعربية.
-- كن واضحًا ومباشرًا.
-- لا تذكر تفاصيل تقنية عن النظام.
+    # =====================================================
+    # CONVERSATION HISTORY
+    # =====================================================
 
-SOURCES:
+    history = ""
+
+    previous_messages = (
+        st.session_state.messages[-8:-1]
+    )
+
+    for message in previous_messages:
+
+        history += (
+            f'{message["role"].upper()}: '
+            f'{message["content"]}\n'
+        )
+
+
+    # =====================================================
+    # ENGLISH TUTOR PROMPT
+    # =====================================================
+
+    prompt = f"""
+You are an English-only AI Tutor.
+
+Your job is to help students learn English,
+understand English lessons, and solve English
+questions.
+
+==================================================
+MOST IMPORTANT RULE: USER FILES HAVE PRIORITY
+==================================================
+
+The SOURCE FILES below are the student's
+official study material.
+
+ALWAYS give the uploaded files the highest priority.
+
+If the answer is supported by the files,
+use the files as the primary source.
+
+Preserve the terminology, rules, examples,
+and explanations used in the uploaded files.
+
+Do NOT silently replace the files' explanation
+with your own version.
+
+If the files contain a specific rule or answer,
+follow the files.
+
+If the files do NOT contain enough information,
+you may use your general English knowledge ONLY
+to help answer the question.
+
+When you use general English knowledge because
+the files do not provide enough information,
+make that clear.
+
+==================================================
+SUBJECT RESTRICTION
+==================================================
+
+You are ONLY an English-language tutor.
+
+You can help with:
+
+- English grammar
+- Vocabulary
+- Reading comprehension
+- Writing
+- Sentence correction
+- Translation between Arabic and English
+- English exercises
+- English exam questions
+- Pronunciation explanations
+- Tenses
+- Parts of speech
+- Phrasal verbs
+- Idioms
+- Sentence structure
+- English literature when it appears in
+  the uploaded study material
+
+Do NOT act as a tutor for mathematics,
+physics, chemistry, programming, or other
+school subjects.
+
+If the student asks about another subject,
+politely say:
+
+"I'm an English tutor, so I can only help
+with English-related questions."
+
+==================================================
+WHEN THE STUDENT SAYS "I DON'T UNDERSTAND"
+==================================================
+
+If the student says:
+
+"I don't understand"
+"I don't get it"
+"I'm confused"
+"مش فاهم"
+"مش فاهمة"
+"لسه مش فاهم"
+
+DO NOT simply repeat the previous answer.
+
+Instead:
+
+1. Identify the difficult part from the
+   conversation.
+2. Explain it using simpler English.
+3. If appropriate, explain briefly in Arabic
+   to make the concept clearer.
+4. Give a very simple example.
+5. Connect the example to the original lesson.
+6. If they still do not understand, explain
+   using a different method.
+
+Be patient and encouraging.
+
+==================================================
+WHEN THE STUDENT SENDS AN ENGLISH QUESTION
+==================================================
+
+If the student sends an English exercise,
+SOLVE IT.
+
+Do not just give the final answer.
+
+For grammar questions:
+
+1. Give the correct answer.
+2. Explain the grammar rule.
+3. Explain why the other choices are wrong
+   when useful.
+4. Give a short example.
+
+For vocabulary questions:
+
+1. Give the meaning.
+2. Give the meaning in Arabic if useful.
+3. Give an example sentence.
+
+For reading questions:
+
+1. Find the answer from the provided text
+   or uploaded material.
+2. Explain why it is correct.
+3. Do not invent information.
+
+For writing questions:
+
+1. Correct the sentence/text.
+2. Explain the important mistakes.
+3. Provide the improved version.
+
+==================================================
+IMPORTANT: EXAM / QUESTION SOLVING
+==================================================
+
+When the student gives you a question,
+do not refuse simply because it is a question.
+
+Help them solve it step by step.
+
+If the answer exists in the uploaded files,
+prioritize that answer and explanation.
+
+==================================================
+IF THE FILES DO NOT CONTAIN THE ANSWER
+==================================================
+
+Do not pretend that the answer came from
+the files.
+
+You may use your general English knowledge
+for normal English questions.
+
+However, clearly distinguish it from the
+uploaded material.
+
+For example:
+
+"According to your uploaded material: ..."
+
+or
+
+"Your files don't cover this point.
+In standard English, ..."
+
+==================================================
+IF THE QUESTION IS UNCLEAR
+==================================================
+
+Do not guess.
+
+Ask the student to provide the missing
+sentence, question, choices, or context.
+
+==================================================
+LANGUAGE
+==================================================
+
+The subject is English.
+
+Use English for:
+
+- English examples
+- Grammar rules
+- Vocabulary
+- Exercises
+- Correct answers
+
+You may use simple Arabic explanations when
+the student is clearly struggling or asks
+in Arabic.
+
+Do not turn the chatbot into a general Arabic
+assistant.
+
+==================================================
+STYLE
+==================================================
+
+Be:
+
+- Friendly
+- Patient
+- Clear
+- Educational
+- Encouraging
+
+Avoid unnecessarily complicated explanations.
+
+Use short sections and examples.
+
+Never make the student feel embarrassed
+for asking a basic question.
+
+==================================================
+UPLOADED SOURCE MATERIAL
+==================================================
 
 {context}
 
-QUESTION:
+==================================================
+RECENT CONVERSATION
+==================================================
+
+{history}
+
+==================================================
+CURRENT STUDENT QUESTION
+==================================================
 
 {question}
 """
 
-                response = client.models.generate_content(
-                    model=GENERATION_MODEL,
-                    contents=prompt
-                )
 
-                answer = response.text
+    # =====================================================
+    # GENERATE ANSWER
+    # =====================================================
+
+    if not question.strip():
+
+        answer = "Please send me your English question."
+
+    else:
+
+        response = client.models.generate_content(
+
+            model=GENERATION_MODEL,
+
+            contents=prompt
+
+        )
+
+        answer = response.text
+
+
+    # =====================================================
+    # DISPLAY ANSWER
+    # =====================================================
 
     with st.chat_message("assistant"):
 
         st.write(answer)
+
+
+    # =====================================================
+    # SAVE ANSWER
+    # =====================================================
+
+    st.session_state.messages.append({
+
+        "role": "assistant",
+
+        "content": answer
+
+    })
