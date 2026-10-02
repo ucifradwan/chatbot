@@ -1,4 +1,4 @@
 venv/
 .streamlit/secrets.toml
-chroma_db/
 __pycache__/
+rag_cache.json
