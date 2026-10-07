@@ -3,5 +3,7 @@ google-genai
 pypdf
 python-docx
 numpy
+pandas
+pydantic
 requests
 bcrypt
