@@ -36,6 +36,8 @@ KNOWLEDGE_FOLDER = "knowledge"
 CACHE_FILE = "rag_cache.json"
 
 TOP_K = 6
+CHUNK_SIZE = 1200
+CHUNK_OVERLAP = 200
 
 
 # =========================================================
@@ -46,16 +48,732 @@ GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 STUDENT_CODE = st.secrets["STUDENT_CODE"]
 
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
-SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+
+# IMPORTANT:
+# Use the Supabase Secret key here.
+# In older Supabase projects it may be called service_role.
+SUPABASE_SECRET_KEY = st.secrets["SUPABASE_SECRET_KEY"]
 
 
 # =========================================================
-# GEMINI CLIENT
+# CLIENTS
 # =========================================================
 
-client = genai.Client(
-    api_key=GEMINI_API_KEY
-)
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+
+# =========================================================
+# SUPABASE HELPERS
+# =========================================================
+
+def supabase_headers():
+    return {
+        "apikey": SUPABASE_SECRET_KEY,
+        "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
+        "Content-Type": "application/json"
+    }
+
+
+# =========================================================
+# AUTH FUNCTIONS
+# =========================================================
+
+def username_exists(username):
+    """
+    Check whether username already exists.
+    """
+
+    url = (
+        f"{SUPABASE_URL}/rest/v1/students"
+        f"?username=eq.{requests.utils.quote(username)}"
+        f"&select=id"
+    )
+
+    try:
+        response = requests.get(
+            url,
+            headers=supabase_headers(),
+            timeout=10
+        )
+
+        if response.status_code != 200:
+            return False
+
+        data = response.json()
+
+        return len(data) > 0
+
+    except Exception:
+        return False
+
+
+def create_student(username, password):
+    """
+    Create a new student account.
+    """
+
+    try:
+        password_hash = bcrypt.hashpw(
+            password.encode("utf-8"),
+            bcrypt.gensalt()
+        ).decode("utf-8")
+
+        url = f"{SUPABASE_URL}/rest/v1/students"
+
+        data = {
+            "username": username,
+            "password_hash": password_hash
+        }
+
+        response = requests.post(
+            url,
+            headers={
+                **supabase_headers(),
+                "Prefer": "return=minimal"
+            },
+            json=data,
+            timeout=10
+        )
+
+        if response.status_code in [200, 201]:
+            return True, ""
+
+        return False, (
+            f"Supabase error {response.status_code}: "
+            f"{response.text}"
+        )
+
+    except Exception as e:
+        return False, str(e)
+
+
+def login_student(username, password):
+    """
+    Login student using username + password.
+    """
+
+    url = (
+        f"{SUPABASE_URL}/rest/v1/students"
+        f"?username=eq.{requests.utils.quote(username)}"
+        f"&select=id,username,password_hash"
+    )
+
+    try:
+        response = requests.get(
+            url,
+            headers=supabase_headers(),
+            timeout=10
+        )
+
+        if response.status_code != 200:
+            return False, f"Supabase error {response.status_code}: {response.text}"
+
+        data = response.json()
+
+        if not data:
+            return False, "Username or password is incorrect."
+
+        student = data[0]
+
+        stored_hash = student["password_hash"]
+
+        valid_password = bcrypt.checkpw(
+            password.encode("utf-8"),
+            stored_hash.encode("utf-8")
+        )
+
+        if valid_password:
+            return True, ""
+
+        return False, "Username or password is incorrect."
+
+    except Exception as e:
+        return False, str(e)
+
+
+# =========================================================
+# FILE READING
+# =========================================================
+
+def read_pdf(path):
+    text = ""
+
+    try:
+        reader = PdfReader(path)
+
+        for page in reader.pages:
+            page_text = page.extract_text()
+
+            if page_text:
+                text += page_text + "\n"
+
+    except Exception as e:
+        st.warning(f"Could not read PDF: {path}")
+
+    return text
+
+
+def read_docx(path):
+    text = ""
+
+    try:
+        document = Document(path)
+
+        for paragraph in document.paragraphs:
+            if paragraph.text.strip():
+                text += paragraph.text + "\n"
+
+    except Exception:
+        st.warning(f"Could not read DOCX: {path}")
+
+    return text
+
+
+def read_txt(path):
+    try:
+        return Path(path).read_text(
+            encoding="utf-8",
+            errors="ignore"
+        )
+    except Exception:
+        return ""
+
+
+def read_file(path):
+    extension = Path(path).suffix.lower()
+
+    if extension == ".pdf":
+        return read_pdf(path)
+
+    elif extension == ".docx":
+        return read_docx(path)
+
+    elif extension == ".txt":
+        return read_txt(path)
+
+    return ""
+
+
+# =========================================================
+# CHUNKING
+# =========================================================
+
+def split_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+
+    text = text.replace("\x00", " ").strip()
+
+    if not text:
+        return []
+
+    chunks = []
+
+    start = 0
+    text_length = len(text)
+
+    while start < text_length:
+
+        end = start + chunk_size
+
+        chunk = text[start:end].strip()
+
+        if chunk:
+            chunks.append(chunk)
+
+        if end >= text_length:
+            break
+
+        start = end - overlap
+
+    return chunks
+
+
+# =========================================================
+# FILE HASH
+# =========================================================
+
+def get_file_hash(path):
+
+    hasher = hashlib.sha256()
+
+    with open(path, "rb") as f:
+
+        while True:
+
+            data = f.read(1024 * 1024)
+
+            if not data:
+                break
+
+            hasher.update(data)
+
+    return hasher.hexdigest()
+
+
+# =========================================================
+# EMBEDDING
+# =========================================================
+
+def create_embedding(text, task_type):
+
+    response = client.models.embed_content(
+        model=EMBEDDING_MODEL,
+        contents=text,
+        config=types.EmbedContentConfig(
+            task_type=task_type
+        )
+    )
+
+    return np.array(
+        response.embeddings[0].values,
+        dtype=np.float32
+    )
+
+
+def normalize_vector(vector):
+
+    norm = np.linalg.norm(vector)
+
+    if norm == 0:
+        return vector
+
+    return vector / norm
+
+
+# =========================================================
+# LOAD CACHE
+# =========================================================
+
+def load_cache():
+
+    if not os.path.exists(CACHE_FILE):
+        return {}
+
+    try:
+
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    except Exception:
+
+        return {}
+
+
+def save_cache(cache):
+
+    try:
+
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+
+            json.dump(
+                cache,
+                f,
+                ensure_ascii=False
+            )
+
+    except Exception:
+        pass
+
+
+# =========================================================
+# BUILD KNOWLEDGE BASE
+# =========================================================
+
+@st.cache_resource
+def build_knowledge():
+
+    knowledge_path = Path(KNOWLEDGE_FOLDER)
+
+    knowledge_path.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    cache = load_cache()
+
+    documents = []
+
+    supported_extensions = [
+        ".pdf",
+        ".docx",
+        ".txt"
+    ]
+
+    files = []
+
+    for extension in supported_extensions:
+
+        files.extend(
+            knowledge_path.glob(f"*{extension}")
+        )
+
+    for file_path in files:
+
+        try:
+
+            file_hash = get_file_hash(file_path)
+
+            text = read_file(file_path)
+
+            if not text.strip():
+                continue
+
+            chunks = split_text(text)
+
+            for index, chunk in enumerate(chunks):
+
+                chunk_id = (
+                    f"{file_path.name}_"
+                    f"{file_hash}_"
+                    f"{index}"
+                )
+
+                # Use cached embedding if available
+                if chunk_id in cache:
+
+                    embedding = np.array(
+                        cache[chunk_id]["embedding"],
+                        dtype=np.float32
+                    )
+
+                else:
+
+                    embedding = create_embedding(
+                        chunk,
+                        "RETRIEVAL_DOCUMENT"
+                    )
+
+                    embedding = normalize_vector(
+                        embedding
+                    )
+
+                    cache[chunk_id] = {
+                        "file": file_path.name,
+                        "text": chunk,
+                        "embedding": embedding.tolist()
+                    }
+
+                    save_cache(cache)
+
+                documents.append(
+                    {
+                        "file": file_path.name,
+                        "text": chunk,
+                        "embedding": embedding
+                    }
+                )
+
+        except Exception as e:
+
+            st.warning(
+                f"Problem reading {file_path.name}: {e}"
+            )
+
+    return documents
+
+
+# =========================================================
+# RAG SEARCH
+# =========================================================
+
+def retrieve_context(question, documents, top_k=TOP_K):
+
+    if not documents:
+        return []
+
+    query_embedding = create_embedding(
+        question,
+        "RETRIEVAL_QUERY"
+    )
+
+    query_embedding = normalize_vector(
+        query_embedding
+    )
+
+    results = []
+
+    for document in documents:
+
+        document_embedding = document["embedding"]
+
+        score = float(
+            np.dot(
+                query_embedding,
+                document_embedding
+            )
+        )
+
+        results.append(
+            {
+                "file": document["file"],
+                "text": document["text"],
+                "score": score
+            }
+        )
+
+    results.sort(
+        key=lambda x: x["score"],
+        reverse=True
+    )
+
+    return results[:top_k]
+
+
+# =========================================================
+# SCREENSHOT QUESTION EXTRACTION
+# =========================================================
+
+def extract_question_from_image(
+    image_bytes,
+    mime_type
+):
+
+    try:
+
+        image_part = types.Part.from_bytes(
+            data=image_bytes,
+            mime_type=mime_type
+        )
+
+        prompt = """
+You are an English teacher.
+
+Look at this screenshot and extract the English
+question or exercise shown in the image.
+
+Return ONLY the question text.
+
+Do not solve it.
+Do not explain it.
+Do not add unnecessary text.
+
+If there is more than one question, extract all
+questions in a clear format.
+"""
+
+        response = client.models.generate_content(
+            model=GENERATION_MODEL,
+            contents=[
+                prompt,
+                image_part
+            ]
+        )
+
+        return response.text.strip()
+
+    except Exception as e:
+
+        return f"Could not read screenshot: {e}"
+
+
+# =========================================================
+# CHAT PROMPT
+# =========================================================
+
+def build_prompt(
+    question,
+    retrieved_documents,
+    conversation_history
+):
+
+    context = ""
+
+    if retrieved_documents:
+
+        for i, document in enumerate(
+            retrieved_documents,
+            start=1
+        ):
+
+            context += (
+                f"\n--- SOURCE {i} ---\n"
+                f"File: {document['file']}\n"
+                f"{document['text']}\n"
+            )
+
+    history_text = ""
+
+    if conversation_history:
+
+        for message in conversation_history[-7:]:
+
+            role = message["role"]
+            content = message["content"]
+
+            history_text += (
+                f"\n{role.upper()}: {content}\n"
+            )
+
+    prompt = f"""
+You are an AI English tutor for students.
+
+IMPORTANT RULES:
+
+1. You ONLY teach English.
+
+You can help with:
+- English grammar
+- Vocabulary
+- Tenses
+- Reading
+- Writing
+- Sentence correction
+- Translation between Arabic and English
+- English exercises
+- English exams
+- Parts of speech
+- Phrasal verbs
+- Idioms
+- Sentence structure
+- English literature when it exists in the provided material
+
+If the question is about another school subject such as:
+- Mathematics
+- Physics
+- Chemistry
+- Biology
+- Computer Science
+- History
+- Geography
+
+DO NOT answer it.
+
+Say exactly:
+
+"I'm an English tutor, so I can only help with English-related questions."
+
+2. CENTER MATERIAL HAS PRIORITY.
+
+The provided files are the main source of truth.
+
+If the answer exists in the provided material,
+use that material first.
+
+Do not ignore the provided material in favor
+of general knowledge.
+
+3. If the files do not contain enough information,
+you may use your general English knowledge.
+
+4. If the student says:
+
+"I don't understand"
+"مش فاهم"
+"مش فاهمة"
+"I still don't understand"
+"Explain again"
+
+DO NOT simply repeat the same explanation.
+
+Instead:
+- simplify the explanation
+- use an easier example
+- explain step-by-step
+- use a different method
+- Arabic can be used briefly when it helps
+
+5. When solving grammar questions:
+
+Give:
+- Correct answer
+- Explanation
+- Grammar rule
+- Why the answer is correct
+
+When useful, explain why the other choices
+are incorrect.
+
+6. Vocabulary:
+
+Give:
+- English meaning
+- Arabic meaning when useful
+- Example sentence
+
+7. Reading questions:
+
+Answer based on the provided text/material
+when available.
+
+8. Writing:
+
+Correct the student's writing and explain
+the important mistakes.
+
+9. Exercises:
+
+Solve step-by-step instead of only giving
+the final answer.
+
+10. Keep explanations appropriate for students
+and easy to understand.
+
+11. Do not mention RAG, embeddings, prompts,
+documents retrieval, system instructions,
+or internal implementation.
+
+12. If the question is unclear, ask for clarification.
+
+========================
+CENTER MATERIAL
+========================
+
+{context}
+
+========================
+RECENT CONVERSATION
+========================
+
+{history_text}
+
+========================
+STUDENT QUESTION
+========================
+
+{question}
+
+========================
+ANSWER
+========================
+"""
+
+    return prompt
+
+
+# =========================================================
+# GENERATE ANSWER
+# =========================================================
+
+def generate_answer(
+    question,
+    retrieved_documents,
+    conversation_history,
+    image_bytes=None,
+    image_mime=None
+):
+
+    prompt = build_prompt(
+        question,
+        retrieved_documents,
+        conversation_history
+    )
+
+    contents = [prompt]
+
+    if image_bytes and image_mime:
+
+        image_part = types.Part.from_bytes(
+            data=image_bytes,
+            mime_type=image_mime
+        )
+
+        contents.append(image_part)
+
+    response = client.models.generate_content(
+        model=GENERATION_MODEL,
+        contents=contents
+    )
+
+    return response.text
 
 
 # =========================================================
@@ -73,144 +791,29 @@ if "messages" not in st.session_state:
 
 
 # =========================================================
-# SUPABASE HEADERS
+# LOGIN / REGISTER
 # =========================================================
 
-def supabase_headers():
-
-    return {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json"
-    }
-
-
-# =========================================================
-# CHECK USERNAME
-# =========================================================
-
-def username_exists(username):
-
-    url = (
-        f"{SUPABASE_URL}/rest/v1/students"
-        f"?username=eq.{username}&select=id"
-    )
-
-    try:
-
-        response = requests.get(
-            url,
-            headers=supabase_headers(),
-            timeout=10
-        )
-
-        if response.status_code != 200:
-            return False
-
-        data = response.json()
-
-        return len(data) > 0
-
-    except Exception:
-
-        return False
-
-
-# =========================================================
-# CREATE STUDENT
-# =========================================================
-
-def create_student(username, password):
-
-    password_hash = bcrypt.hashpw(
-        password.encode("utf-8"),
-        bcrypt.gensalt()
-    ).decode("utf-8")
-
-    url = f"{SUPABASE_URL}/rest/v1/students"
-
-    data = {
-        "username": username,
-        "password_hash": password_hash
-    }
-
-    try:
-
-        response = requests.post(
-            url,
-            headers=supabase_headers(),
-            json=data,
-            timeout=10
-        )
-
-        return response.status_code in [200, 201]
-
-    except Exception:
-
-        return False
-
-
-# =========================================================
-# LOGIN STUDENT
-# =========================================================
-
-def login_student(username, password):
-
-    url = (
-        f"{SUPABASE_URL}/rest/v1/students"
-        f"?username=eq.{username}"
-        f"&select=username,password_hash"
-    )
-
-    try:
-
-        response = requests.get(
-            url,
-            headers=supabase_headers(),
-            timeout=10
-        )
-
-        if response.status_code != 200:
-            return False
-
-        data = response.json()
-
-        if len(data) == 0:
-            return False
-
-        stored_hash = data[0]["password_hash"]
-
-        return bcrypt.checkpw(
-            password.encode("utf-8"),
-            stored_hash.encode("utf-8")
-        )
-
-    except Exception:
-
-        return False
-
-
-# =========================================================
-# AUTHENTICATION PAGE
-# =========================================================
-
-def authentication_page():
+if not st.session_state.logged_in:
 
     st.title("📚 English AI Tutor")
 
     st.write(
-        "This AI Tutor is available only for students of the center."
+        "Please login or create your student account."
     )
 
-    tab_login, tab_register = st.tabs(
-        ["🔐 Login", "📝 Create Account"]
+    login_tab, register_tab = st.tabs(
+        [
+            "🔐 Login",
+            "📝 Register"
+        ]
     )
 
     # =====================================================
     # LOGIN
     # =====================================================
 
-    with tab_login:
+    with login_tab:
 
         st.subheader("Login")
 
@@ -227,54 +830,44 @@ def authentication_page():
 
         if st.button(
             "Login",
-            use_container_width=True,
-            key="login_button"
+            use_container_width=True
         ):
 
-            if not login_username:
+            if not login_username or not login_password:
 
                 st.error(
-                    "Please enter your username."
+                    "Please enter username and password."
                 )
-
-            elif not login_password:
-
-                st.error(
-                    "Please enter your password."
-                )
-
-            elif login_student(
-                login_username.strip(),
-                login_password
-            ):
-
-                st.session_state.logged_in = True
-
-                st.session_state.username = (
-                    login_username.strip()
-                )
-
-                st.session_state.messages = []
-
-                st.rerun()
 
             else:
 
-                st.error(
-                    "Incorrect username or password."
+                success, error_message = login_student(
+                    login_username.strip(),
+                    login_password
                 )
+
+                if success:
+
+                    st.session_state.logged_in = True
+                    st.session_state.username = (
+                        login_username.strip()
+                    )
+
+                    st.session_state.messages = []
+
+                    st.rerun()
+
+                else:
+
+                    st.error(error_message)
 
     # =====================================================
     # REGISTER
     # =====================================================
 
-    with tab_register:
+    with register_tab:
 
         st.subheader("Create Student Account")
-
-        st.info(
-            "You need the Student Code provided by the center."
-        )
 
         register_code = st.text_input(
             "Student Code",
@@ -293,60 +886,40 @@ def authentication_page():
             key="register_password"
         )
 
-        register_confirm_password = st.text_input(
+        register_confirm = st.text_input(
             "Confirm Password",
             type="password",
-            key="register_confirm_password"
+            key="register_confirm"
         )
 
         if st.button(
             "Create Account",
-            use_container_width=True,
-            key="create_account_button"
+            use_container_width=True
         ):
 
-            register_code = register_code.strip()
-            register_username = register_username.strip()
-            register_password = register_password.strip()
-            register_confirm_password = (
-                register_confirm_password.strip()
-            )
-
-            # ---------------------------------------------
-            # STUDENT CODE
-            # ---------------------------------------------
-
+            # Check student code
             if register_code != STUDENT_CODE:
 
                 st.error(
-                    "Invalid Student Code. "
-                    "Please contact the center."
+                    "Invalid Student Code."
                 )
 
-            # ---------------------------------------------
-            # USERNAME
-            # ---------------------------------------------
-
-            elif not register_username:
+            elif not register_username.strip():
 
                 st.error(
                     "Please choose a username."
                 )
 
-            elif len(register_username) < 4:
-
-                st.error(
-                    "Username must be at least 4 characters."
-                )
-
-            # ---------------------------------------------
-            # PASSWORD
-            # ---------------------------------------------
-
             elif not register_password:
 
                 st.error(
                     "Please choose a password."
+                )
+
+            elif register_password != register_confirm:
+
+                st.error(
+                    "Passwords do not match."
                 )
 
             elif len(register_password) < 6:
@@ -355,965 +928,311 @@ def authentication_page():
                     "Password must be at least 6 characters."
                 )
 
-            elif register_password != register_confirm_password:
-
-                st.error(
-                    "Passwords do not match."
-                )
-
-            # ---------------------------------------------
-            # CHECK USERNAME
-            # ---------------------------------------------
-
-            elif username_exists(register_username):
-
-                st.error(
-                    "This username is already registered."
-                )
-
-            # ---------------------------------------------
-            # CREATE ACCOUNT
-            # ---------------------------------------------
-
             else:
 
-                success = create_student(
-                    register_username,
-                    register_password
-                )
+                username = register_username.strip()
 
-                if success:
+                # Check username
+                if username_exists(username):
 
-                    st.success(
-                        "Account created successfully!"
-                    )
-
-                    st.info(
-                        "You can now login using your "
-                        "username and password."
+                    st.error(
+                        "This username already exists. "
+                        "Please choose another one."
                     )
 
                 else:
 
-                    st.error(
-                        "Could not create account. "
-                        "Please try again."
+                    success, error_message = create_student(
+                        username,
+                        register_password
                     )
 
+                    if success:
 
-# =========================================================
-# READ PDF
-# =========================================================
+                        st.success(
+                            "Account created successfully! 🎉"
+                        )
 
-def read_pdf(path):
+                        st.info(
+                            "You can now login using "
+                            "your username and password."
+                        )
 
-    reader = PdfReader(path)
+                    else:
 
-    text = ""
+                        st.error(
+                            "Could not create account."
+                        )
 
-    for page in reader.pages:
+                        # Show real Supabase error
+                        st.code(
+                            error_message
+                        )
 
-        page_text = page.extract_text()
-
-        if page_text:
-
-            text += page_text + "\n"
-
-    return text
-
-
-# =========================================================
-# READ DOCX
-# =========================================================
-
-def read_docx(path):
-
-    doc = Document(path)
-
-    text = []
-
-    for paragraph in doc.paragraphs:
-
-        if paragraph.text.strip():
-
-            text.append(
-                paragraph.text
-            )
-
-    return "\n".join(text)
+    st.stop()
 
 
 # =========================================================
-# READ TXT
+# LOGGED-IN CHATBOT
 # =========================================================
 
-def read_txt(path):
+st.title("📚 English AI Tutor")
 
-    with open(
-        path,
-        "r",
-        encoding="utf-8",
-        errors="ignore"
-    ) as file:
-
-        return file.read()
+st.caption(
+    f"Logged in as: {st.session_state.username}"
+)
 
 
 # =========================================================
-# READ FILE
+# SIDEBAR
 # =========================================================
 
-def read_file(path):
+with st.sidebar:
 
-    extension = Path(path).suffix.lower()
-
-    if extension == ".pdf":
-
-        return read_pdf(path)
-
-    elif extension == ".docx":
-
-        return read_docx(path)
-
-    elif extension == ".txt":
-
-        return read_txt(path)
-
-    return ""
-
-
-# =========================================================
-# SPLIT TEXT
-# =========================================================
-
-def split_text(
-    text,
-    chunk_size=1200,
-    overlap=200
-):
-
-    chunks = []
-
-    start = 0
-
-    while start < len(text):
-
-        end = start + chunk_size
-
-        chunk = text[start:end].strip()
-
-        if chunk:
-
-            chunks.append(chunk)
-
-        start = end - overlap
-
-    return chunks
-
-
-# =========================================================
-# FILE HASH
-# =========================================================
-
-def get_file_hash(path):
-
-    sha = hashlib.sha256()
-
-    with open(path, "rb") as file:
-
-        while True:
-
-            data = file.read(1024 * 1024)
-
-            if not data:
-                break
-
-            sha.update(data)
-
-    return sha.hexdigest()
-
-
-# =========================================================
-# CACHE
-# =========================================================
-
-def load_cache():
-
-    if not os.path.exists(CACHE_FILE):
-
-        return {}
-
-    try:
-
-        with open(
-            CACHE_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            return json.load(file)
-
-    except Exception:
-
-        return {}
-
-
-def save_cache(cache):
-
-    with open(
-        CACHE_FILE,
-        "w",
-        encoding="utf-8"
-    ) as file:
-
-        json.dump(
-            cache,
-            file,
-            ensure_ascii=False
-        )
-
-
-# =========================================================
-# CREATE EMBEDDING
-# =========================================================
-
-def create_embedding(
-    text,
-    task_type
-):
-
-    result = client.models.embed_content(
-
-        model=EMBEDDING_MODEL,
-
-        contents=text,
-
-        config=types.EmbedContentConfig(
-            task_type=task_type
-        )
-    )
-
-    vector = np.array(
-        result.embeddings[0].values,
-        dtype=np.float32
-    )
-
-    norm = np.linalg.norm(vector)
-
-    if norm > 0:
-
-        vector = vector / norm
-
-    return vector
-
-
-# =========================================================
-# BUILD KNOWLEDGE BASE
-# =========================================================
-
-@st.cache_resource
-def build_knowledge():
-
-    os.makedirs(
-        KNOWLEDGE_FOLDER,
-        exist_ok=True
-    )
-
-    cache = load_cache()
-
-    knowledge = []
-
-    for filename in os.listdir(
-        KNOWLEDGE_FOLDER
-    ):
-
-        path = os.path.join(
-            KNOWLEDGE_FOLDER,
-            filename
-        )
-
-        if not os.path.isfile(path):
-
-            continue
-
-        extension = Path(path).suffix.lower()
-
-        if extension not in [
-            ".pdf",
-            ".docx",
-            ".txt"
-        ]:
-
-            continue
-
-        file_hash = get_file_hash(path)
-
-        # ---------------------------------------------
-        # USE CACHE
-        # ---------------------------------------------
-
-        if file_hash in cache:
-
-            for item in cache[file_hash]:
-
-                knowledge.append({
-
-                    "text": item["text"],
-
-                    "embedding": np.array(
-                        item["embedding"],
-                        dtype=np.float32
-                    ),
-
-                    "source": item["source"]
-
-                })
-
-            continue
-
-        # ---------------------------------------------
-        # READ FILE
-        # ---------------------------------------------
-
-        text = read_file(path)
-
-        if not text.strip():
-
-            continue
-
-        chunks = split_text(text)
-
-        file_data = []
-
-        for chunk in chunks:
-
-            embedding = create_embedding(
-                chunk,
-                "RETRIEVAL_DOCUMENT"
-            )
-
-            item = {
-
-                "text": chunk,
-
-                "embedding": embedding.tolist(),
-
-                "source": os.path.basename(path)
-
-            }
-
-            file_data.append(item)
-
-            knowledge.append({
-
-                "text": chunk,
-
-                "embedding": embedding,
-
-                "source": os.path.basename(path)
-
-            })
-
-        cache[file_hash] = file_data
-
-    save_cache(cache)
-
-    return knowledge
-
-
-# =========================================================
-# SEARCH KNOWLEDGE
-# =========================================================
-
-def search_knowledge(
-    query,
-    knowledge,
-    top_k=TOP_K
-):
-
-    if not knowledge:
-
-        return []
-
-    query_embedding = create_embedding(
-        query,
-        "RETRIEVAL_QUERY"
-    )
-
-    scored = []
-
-    for item in knowledge:
-
-        score = float(
-            np.dot(
-                query_embedding,
-                item["embedding"]
-            )
-        )
-
-        scored.append(
-            (
-                score,
-                item
-            )
-        )
-
-    scored.sort(
-        key=lambda x: x[0],
-        reverse=True
-    )
-
-    return [
-        item
-        for score, item in scored[:top_k]
-    ]
-
-
-# =========================================================
-# EXTRACT QUESTION FROM SCREENSHOT
-# =========================================================
-
-def extract_question_from_image(
-    image_bytes,
-    mime_type
-):
-
-    image_part = types.Part.from_bytes(
-        data=image_bytes,
-        mime_type=mime_type
-    )
-
-    prompt = """
-You are an English exam question reader.
-
-Look carefully at the uploaded screenshot.
-
-Extract the English question, choices, passage,
-sentences, or exercise shown in the image.
-
-DO NOT solve the question.
-
-Return a clean text representation of the
-question that can be used for semantic search.
-
-If there are multiple questions,
-include all of them.
-
-Do not add explanations.
-"""
-
-    response = client.models.generate_content(
-
-        model=GENERATION_MODEL,
-
-        contents=[
-            image_part,
-            prompt
-        ]
-    )
-
-    return response.text.strip()
-
-
-# =========================================================
-# GENERATE ANSWER
-# =========================================================
-
-def generate_answer(
-    user_question,
-    context,
-    history,
-    image_bytes=None,
-    image_type=None
-):
-
-    # -----------------------------------------------------
-    # CONVERSATION HISTORY
-    # -----------------------------------------------------
-
-    history_text = ""
-
-    for message in history[-7:]:
-
-        history_text += (
-            f"{message['role']}: "
-            f"{message['content']}\n"
-        )
-
-    # -----------------------------------------------------
-    # MAIN PROMPT
-    # -----------------------------------------------------
-
-    prompt = f"""
-You are an AI English tutor for students
-of an educational center.
-
-==================================================
-SUBJECT LIMIT
-==================================================
-
-You ONLY help with English-related topics.
-
-You can help with:
-
-- English grammar
-- Vocabulary
-- Reading comprehension
-- Writing
-- Sentence correction
-- Translation between Arabic and English
-- English exercises
-- English exams
-- Tenses
-- Parts of speech
-- Sentence structure
-- Phrasal verbs
-- Idioms
-- English literature when relevant
-  to the uploaded center material
-
-If the student asks about another subject,
-politely say:
-
-"I'm an English tutor, so I can only help
-with English-related questions."
-
-==================================================
-CENTER MATERIAL
-==================================================
-
-The following information was retrieved
-from the center's uploaded files.
-
-The center material has HIGHEST PRIORITY.
-
-CENTER MATERIAL:
-
-{context}
-
-==================================================
-STUDENT QUESTION
-==================================================
-
-{user_question}
-
-==================================================
-PREVIOUS CONVERSATION
-==================================================
-
-{history_text}
-
-==================================================
-IMPORTANT RULES
-==================================================
-
-1. Answer the student's actual question.
-
-2. If the answer or rule exists in the
-   center material, prioritize it.
-
-3. Do not contradict the center material.
-
-4. For grammar questions:
-
-   - Give the correct answer.
-   - Explain the grammar rule.
-   - Explain why it is correct.
-   - Explain why the other choices are wrong
-     when useful.
-
-5. For vocabulary:
-
-   - Give the meaning.
-   - Give Arabic meaning when useful.
-   - Give a simple example.
-
-6. For reading:
-
-   - Answer from the provided text.
-   - Explain why the answer is correct.
-
-7. For writing:
-
-   - Correct mistakes.
-   - Explain the mistakes.
-   - Give an improved version.
-
-8. For exercises and exams:
-
-   - Solve step-by-step.
-   - Do not give only the final answer.
-
-9. If the student says:
-
-   "I don't understand"
-   "مش فاهم"
-   "مش فاهمة"
-
-   DO NOT simply repeat the previous explanation.
-
-   Instead:
-
-   - Use simpler English.
-   - Give a very simple example.
-   - Use Arabic briefly if helpful.
-   - Explain using a different method.
-
-10. If the uploaded screenshot contains
-    an English question, understand it
-    and solve it.
-
-11. If the screenshot is unclear,
-    tell the student what part is unclear.
-
-12. Do not answer questions from subjects
-    other than English.
-
-13. If the center material does not contain
-    enough information, you may use general
-    English knowledge.
-
-    Clearly distinguish general knowledge
-    from the center material.
-
-14. Keep explanations suitable for students.
-
-Give a clear educational answer.
-"""
-
-    contents = []
-
-    # -----------------------------------------------------
-    # ADD IMAGE
-    # -----------------------------------------------------
-
-    if image_bytes is not None:
-
-        image_part = types.Part.from_bytes(
-            data=image_bytes,
-            mime_type=image_type
-        )
-
-        contents.append(image_part)
-
-    # -----------------------------------------------------
-    # ADD TEXT PROMPT
-    # -----------------------------------------------------
-
-    contents.append(prompt)
-
-    # -----------------------------------------------------
-    # GEMINI
-    # -----------------------------------------------------
-
-    response = client.models.generate_content(
-
-        model=GENERATION_MODEL,
-
-        contents=contents
-    )
-
-    return response.text
-
-
-# =========================================================
-# CHATBOT PAGE
-# =========================================================
-
-def chatbot_page():
-
-    # =====================================================
-    # SIDEBAR
-    # =====================================================
-
-    with st.sidebar:
-
-        st.title("📚 English AI Tutor")
-
-        st.write(
-            f"Logged in as: **{st.session_state.username}**"
-        )
-
-        st.divider()
-
-        if st.button(
-            "Logout",
-            use_container_width=True
-        ):
-
-            st.session_state.logged_in = False
-
-            st.session_state.username = ""
-
-            st.session_state.messages = []
-
-            st.rerun()
-
-        st.divider()
-
-        st.caption(
-            "English questions only."
-        )
-
-    # =====================================================
-    # HEADER
-    # =====================================================
-
-    st.title("📚 English AI Tutor")
+    st.header("Student")
 
     st.write(
-        "Ask your English question or upload "
-        "a screenshot."
+        f"👤 {st.session_state.username}"
     )
 
-    # =====================================================
-    # LOAD KNOWLEDGE
-    # =====================================================
+    st.divider()
 
-    try:
+    if st.button(
+        "🚪 Logout",
+        use_container_width=True
+    ):
 
-        knowledge = build_knowledge()
+        st.session_state.logged_in = False
+        st.session_state.username = ""
+        st.session_state.messages = []
 
-    except Exception as e:
+        st.rerun()
 
-        st.error(
-            "There was a problem loading "
-            "the center files."
+    st.divider()
+
+    st.info(
+        "This chatbot is specialized in English only."
+    )
+
+
+# =========================================================
+# LOAD RAG
+# =========================================================
+
+with st.spinner(
+    "Loading English learning materials..."
+):
+
+    documents = build_knowledge()
+
+
+if not documents:
+
+    st.warning(
+        "No English files were found in the knowledge folder."
+    )
+
+
+# =========================================================
+# DISPLAY CHAT HISTORY
+# =========================================================
+
+for message in st.session_state.messages:
+
+    with st.chat_message(
+        message["role"]
+    ):
+
+        st.markdown(
+            message["content"]
         )
 
-        st.code(str(e))
 
-        knowledge = []
+# =========================================================
+# SCREENSHOT UPLOAD
+# =========================================================
 
-    # =====================================================
-    # DISPLAY CHAT HISTORY
-    # =====================================================
+uploaded_image = st.file_uploader(
+    "📷 Upload a screenshot of an English question",
+    type=[
+        "png",
+        "jpg",
+        "jpeg",
+        "webp"
+    ],
+    key="question_image"
+)
 
-    for message in st.session_state.messages:
 
-        with st.chat_message(
-            message["role"]
-        ):
+# =========================================================
+# CHAT INPUT
+# =========================================================
 
-            st.markdown(
-                message["content"]
-            )
+user_question = st.chat_input(
+    "Ask your English question..."
+)
 
-    # =====================================================
-    # SCREENSHOT UPLOAD
-    # =====================================================
 
-    uploaded_image = st.file_uploader(
+# =========================================================
+# PROCESS QUESTION
+# =========================================================
 
-        "📷 Upload a screenshot "
-        "of an English question",
+if user_question or uploaded_image:
 
-        type=[
-            "png",
-            "jpg",
-            "jpeg",
-            "webp"
-        ],
-
-        key="question_image"
+    typed_question = (
+        user_question.strip()
+        if user_question
+        else ""
     )
+
+    image_bytes = None
+    image_mime = None
+    extracted_question = ""
+
+    # =====================================================
+    # PROCESS IMAGE
+    # =====================================================
 
     if uploaded_image:
 
-        st.image(
-            uploaded_image,
-            caption="Uploaded question",
-            use_container_width=True
+        image_bytes = uploaded_image.getvalue()
+        image_mime = uploaded_image.type
+
+        with st.spinner(
+            "Reading the screenshot..."
+        ):
+
+            extracted_question = (
+                extract_question_from_image(
+                    image_bytes,
+                    image_mime
+                )
+            )
+
+    # =====================================================
+    # COMBINE QUESTION
+    # =====================================================
+
+    if typed_question and extracted_question:
+
+        final_question = (
+            f"{typed_question}\n\n"
+            f"Question from screenshot:\n"
+            f"{extracted_question}"
         )
 
+    elif typed_question:
+
+        final_question = typed_question
+
+    elif extracted_question:
+
+        final_question = extracted_question
+
+    else:
+
+        final_question = ""
+
+    if not final_question:
+
+        st.error(
+            "Please type a question or upload a screenshot."
+        )
+
+        st.stop()
+
     # =====================================================
-    # TEXT QUESTION
+    # SHOW USER QUESTION
     # =====================================================
 
-    user_question = st.chat_input(
-        "Ask your English question..."
-    )
+    with st.chat_message("user"):
 
-    # =====================================================
-    # PROCESS
-    # =====================================================
-
-    if user_question or uploaded_image:
-
-        image_bytes = None
-        image_type = None
-
-        extracted_question = ""
-
-        # =================================================
-        # IMAGE
-        # =================================================
+        if typed_question:
+            st.markdown(typed_question)
 
         if uploaded_image:
 
-            image_bytes = uploaded_image.getvalue()
-
-            image_type = uploaded_image.type
-
-            try:
-
-                extracted_question = (
-                    extract_question_from_image(
-                        image_bytes,
-                        image_type
-                    )
-                )
-
-            except Exception as e:
-
-                st.error(
-                    "I couldn't read the screenshot."
-                )
-
-                st.code(str(e))
-
-                return
-
-        # =================================================
-        # SEARCH QUERY
-        # =================================================
-
-        if user_question and extracted_question:
-
-            search_query = (
-                f"{user_question}\n"
-                f"{extracted_question}"
+            st.image(
+                uploaded_image,
+                caption="Uploaded question",
+                use_container_width=True
             )
 
-        elif user_question:
+    # =====================================================
+    # SAVE USER MESSAGE
+    # =====================================================
 
-            search_query = user_question
-
-        else:
-
-            search_query = extracted_question
-
-        # =================================================
-        # RAG
-        # =================================================
-
-        retrieved = search_knowledge(
-            search_query,
-            knowledge
-        )
-
-        context_parts = []
-
-        for item in retrieved:
-
-            context_parts.append(
-                f"[Source: {item['source']}]\n"
-                f"{item['text']}"
-            )
-
-        context = "\n\n---\n\n".join(
-            context_parts
-        )
-
-        # =================================================
-        # DISPLAY USER MESSAGE
-        # =================================================
-
-        display_question = user_question
-
-        if not display_question:
-
-            display_question = (
-                "📷 Uploaded English question"
-            )
-
-        st.session_state.messages.append({
-
+    st.session_state.messages.append(
+        {
             "role": "user",
+            "content": final_question
+        }
+    )
 
-            "content": display_question
+    # =====================================================
+    # RAG SEARCH
+    # =====================================================
 
-        })
-
-        with st.chat_message("user"):
-
-            st.markdown(
-                display_question
-            )
-
-        # =================================================
-        # GENERATE ANSWER
-        # =================================================
-
-        with st.chat_message("assistant"):
-
-            with st.spinner(
-                "Thinking and checking "
-                "the center material..."
-            ):
-
-                try:
-
-                    answer = generate_answer(
-
-                        user_question=search_query,
-
-                        context=context,
-
-                        history=st.session_state.messages,
-
-                        image_bytes=image_bytes,
-
-                        image_type=image_type
-
-                    )
-
-                    st.markdown(answer)
-
-                except Exception as e:
-
-                    answer = (
-                        "Sorry, something went wrong "
-                        "while processing your question."
-                    )
-
-                    st.error(answer)
-
-                    st.code(str(e))
-
-        # =================================================
-        # SAVE ANSWER
-        # =================================================
-
-        st.session_state.messages.append({
-
-            "role": "assistant",
-
-            "content": answer
-
-        })
-
-        # =================================================
-        # CLEAR IMAGE
-        # =================================================
+    with st.spinner(
+        "Searching English materials..."
+    ):
 
         try:
 
-            st.session_state.question_image = None
+            retrieved_documents = retrieve_context(
+                final_question,
+                documents,
+                TOP_K
+            )
 
-        except Exception:
+        except Exception as e:
 
-            pass
+            retrieved_documents = []
 
+            st.warning(
+                f"Could not search the knowledge base: {e}"
+            )
 
-# =========================================================
-# START APP
-# =========================================================
+    # =====================================================
+    # GENERATE ANSWER
+    # =====================================================
 
-if not st.session_state.logged_in:
+    with st.chat_message("assistant"):
 
-    authentication_page()
+        with st.spinner(
+            "Preparing your answer..."
+        ):
 
-else:
+            try:
 
-    chatbot_page()
+                answer = generate_answer(
+                    question=final_question,
+                    retrieved_documents=retrieved_documents,
+                    conversation_history=st.session_state.messages,
+                    image_bytes=image_bytes,
+                    image_mime=image_mime
+                )
+
+                st.markdown(answer)
+
+            except Exception as e:
+
+                answer = (
+                    "Sorry, I couldn't generate an answer "
+                    "right now."
+                )
+
+                st.error(answer)
+
+                st.code(str(e))
+
+    # =====================================================
+    # SAVE ASSISTANT MESSAGE
+    # =====================================================
+
+    st.session_state.messages.append(
+        {
+            "role": "assistant",
+            "content": answer
+        }
+    )
