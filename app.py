@@ -685,6 +685,14 @@ with st.sidebar:
                 build_knowledge.clear()
                 st.rerun()
 
+            if os.path.exists(CACHE_FILE):
+                with open(CACHE_FILE, "rb") as f:
+                    st.download_button(
+                        "⬇️ Download rag_cache.json",
+                        f.read(),
+                        file_name=CACHE_FILE,
+                    )
+
             st.caption("Latest student questions")
             st.dataframe(admin_recent_questions())
 
