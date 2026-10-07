@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import json
 import hashlib
+import time
 import numpy as np
 import requests
 import bcrypt
@@ -49,24 +50,26 @@ STUDENT_CODE = st.secrets["STUDENT_CODE"]
 
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 
-# IMPORTANT:
-# Use the Supabase Secret key here.
-# In older Supabase projects it may be called service_role.
+# Supabase Secret Key
+# In older projects this may be called service_role
 SUPABASE_SECRET_KEY = st.secrets["SUPABASE_SECRET_KEY"]
 
 
 # =========================================================
-# CLIENTS
+# GEMINI CLIENT
 # =========================================================
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+client = genai.Client(
+    api_key=GEMINI_API_KEY
+)
 
 
 # =========================================================
-# SUPABASE HELPERS
+# SUPABASE
 # =========================================================
 
 def supabase_headers():
+
     return {
         "apikey": SUPABASE_SECRET_KEY,
         "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
@@ -75,13 +78,10 @@ def supabase_headers():
 
 
 # =========================================================
-# AUTH FUNCTIONS
+# AUTH
 # =========================================================
 
 def username_exists(username):
-    """
-    Check whether username already exists.
-    """
 
     url = (
         f"{SUPABASE_URL}/rest/v1/students"
@@ -90,6 +90,7 @@ def username_exists(username):
     )
 
     try:
+
         response = requests.get(
             url,
             headers=supabase_headers(),
@@ -104,15 +105,14 @@ def username_exists(username):
         return len(data) > 0
 
     except Exception:
+
         return False
 
 
 def create_student(username, password):
-    """
-    Create a new student account.
-    """
 
     try:
+
         password_hash = bcrypt.hashpw(
             password.encode("utf-8"),
             bcrypt.gensalt()
@@ -136,6 +136,7 @@ def create_student(username, password):
         )
 
         if response.status_code in [200, 201]:
+
             return True, ""
 
         return False, (
@@ -144,13 +145,11 @@ def create_student(username, password):
         )
 
     except Exception as e:
+
         return False, str(e)
 
 
 def login_student(username, password):
-    """
-    Login student using username + password.
-    """
 
     url = (
         f"{SUPABASE_URL}/rest/v1/students"
@@ -159,6 +158,7 @@ def login_student(username, password):
     )
 
     try:
+
         response = requests.get(
             url,
             headers=supabase_headers(),
@@ -166,11 +166,16 @@ def login_student(username, password):
         )
 
         if response.status_code != 200:
-            return False, f"Supabase error {response.status_code}: {response.text}"
+
+            return False, (
+                f"Supabase error {response.status_code}: "
+                f"{response.text}"
+            )
 
         data = response.json()
 
         if not data:
+
             return False, "Username or password is incorrect."
 
         student = data[0]
@@ -183,11 +188,13 @@ def login_student(username, password):
         )
 
         if valid_password:
+
             return True, ""
 
         return False, "Username or password is incorrect."
 
     except Exception as e:
+
         return False, str(e)
 
 
@@ -196,59 +203,81 @@ def login_student(username, password):
 # =========================================================
 
 def read_pdf(path):
+
     text = ""
 
     try:
+
         reader = PdfReader(path)
 
         for page in reader.pages:
+
             page_text = page.extract_text()
 
             if page_text:
+
                 text += page_text + "\n"
 
-    except Exception as e:
-        st.warning(f"Could not read PDF: {path}")
+    except Exception:
+
+        st.warning(
+            f"Could not read PDF: {path}"
+        )
 
     return text
 
 
 def read_docx(path):
+
     text = ""
 
     try:
+
         document = Document(path)
 
         for paragraph in document.paragraphs:
+
             if paragraph.text.strip():
+
                 text += paragraph.text + "\n"
 
     except Exception:
-        st.warning(f"Could not read DOCX: {path}")
+
+        st.warning(
+            f"Could not read DOCX: {path}"
+        )
 
     return text
 
 
 def read_txt(path):
+
     try:
+
         return Path(path).read_text(
             encoding="utf-8",
             errors="ignore"
         )
+
     except Exception:
+
         return ""
 
 
 def read_file(path):
+
     extension = Path(path).suffix.lower()
 
     if extension == ".pdf":
+
         return read_pdf(path)
 
     elif extension == ".docx":
+
         return read_docx(path)
 
     elif extension == ".txt":
+
         return read_txt(path)
 
     return ""
@@ -258,16 +287,25 @@ def read_file(path):
 # CHUNKING
 # =========================================================
 
-def split_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+def split_text(
+    text,
+    chunk_size=CHUNK_SIZE,
+    overlap=CHUNK_OVERLAP
+):
 
-    text = text.replace("\x00", " ").strip()
+    text = text.replace(
+        "\x00",
+        " "
+    ).strip()
 
     if not text:
+
         return []
 
     chunks = []
 
     start = 0
+
     text_length = len(text)
 
     while start < text_length:
@@ -277,9 +315,11 @@ def split_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
         chunk = text[start:end].strip()
 
         if chunk:
+
             chunks.append(chunk)
 
         if end >= text_length:
+
             break
 
         start = end - overlap
@@ -299,9 +339,12 @@ def get_file_hash(path):
 
         while True:
 
-            data = f.read(1024 * 1024)
+            data = f.read(
+                1024 * 1024
+            )
 
             if not data:
+
                 break
 
             hasher.update(data)
@@ -310,10 +353,13 @@ def get_file_hash(path):
 
 
 # =========================================================
-# EMBEDDING
+# EMBEDDINGS
 # =========================================================
 
-def create_embedding(text, task_type):
+def create_embedding(
+    text,
+    task_type
+):
 
     response = client.models.embed_content(
         model=EMBEDDING_MODEL,
@@ -334,23 +380,30 @@ def normalize_vector(vector):
     norm = np.linalg.norm(vector)
 
     if norm == 0:
+
         return vector
 
     return vector / norm
 
 
 # =========================================================
-# LOAD CACHE
+# CACHE
 # =========================================================
 
 def load_cache():
 
     if not os.path.exists(CACHE_FILE):
+
         return {}
 
     try:
 
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+        with open(
+            CACHE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
             return json.load(f)
 
     except Exception:
@@ -362,7 +415,11 @@ def save_cache(cache):
 
     try:
 
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        with open(
+            CACHE_FILE,
+            "w",
+            encoding="utf-8"
+        ) as f:
 
             json.dump(
                 cache,
@@ -371,6 +428,7 @@ def save_cache(cache):
             )
 
     except Exception:
+
         pass
 
 
@@ -381,7 +439,9 @@ def save_cache(cache):
 @st.cache_resource
 def build_knowledge():
 
-    knowledge_path = Path(KNOWLEDGE_FOLDER)
+    knowledge_path = Path(
+        KNOWLEDGE_FOLDER
+    )
 
     knowledge_path.mkdir(
         parents=True,
@@ -403,21 +463,30 @@ def build_knowledge():
     for extension in supported_extensions:
 
         files.extend(
-            knowledge_path.glob(f"*{extension}")
+            knowledge_path.glob(
+                f"*{extension}"
+            )
         )
 
     for file_path in files:
 
         try:
 
-            file_hash = get_file_hash(file_path)
+            file_hash = get_file_hash(
+                file_path
+            )
 
-            text = read_file(file_path)
+            text = read_file(
+                file_path
+            )
 
             if not text.strip():
+
                 continue
 
-            chunks = split_text(text)
+            chunks = split_text(
+                text
+            )
 
             for index, chunk in enumerate(chunks):
 
@@ -427,7 +496,6 @@ def build_knowledge():
                     f"{index}"
                 )
 
-                # Use cached embedding if available
                 if chunk_id in cache:
 
                     embedding = np.array(
@@ -465,7 +533,8 @@ def build_knowledge():
         except Exception as e:
 
             st.warning(
-                f"Problem reading {file_path.name}: {e}"
+                f"Problem reading "
+                f"{file_path.name}: {e}"
             )
 
     return documents
@@ -475,9 +544,14 @@ def build_knowledge():
 # RAG SEARCH
 # =========================================================
 
-def retrieve_context(question, documents, top_k=TOP_K):
+def retrieve_context(
+    question,
+    documents,
+    top_k=TOP_K
+):
 
     if not documents:
+
         return []
 
     query_embedding = create_embedding(
@@ -493,7 +567,9 @@ def retrieve_context(question, documents, top_k=TOP_K):
 
     for document in documents:
 
-        document_embedding = document["embedding"]
+        document_embedding = (
+            document["embedding"]
+        )
 
         score = float(
             np.dot(
@@ -519,7 +595,7 @@ def retrieve_context(question, documents, top_k=TOP_K):
 
 
 # =========================================================
-# SCREENSHOT QUESTION EXTRACTION
+# SCREENSHOT
 # =========================================================
 
 def extract_question_from_image(
@@ -537,17 +613,16 @@ def extract_question_from_image(
         prompt = """
 You are an English teacher.
 
-Look at this screenshot and extract the English
-question or exercise shown in the image.
+Look at this screenshot and extract the
+English question or exercise shown in the image.
 
 Return ONLY the question text.
 
 Do not solve it.
 Do not explain it.
-Do not add unnecessary text.
 
-If there is more than one question, extract all
-questions in a clear format.
+If there is more than one question,
+extract all questions clearly.
 """
 
         response = client.models.generate_content(
@@ -562,11 +637,13 @@ questions in a clear format.
 
     except Exception as e:
 
-        return f"Could not read screenshot: {e}"
+        return (
+            f"Could not read screenshot: {e}"
+        )
 
 
 # =========================================================
-# CHAT PROMPT
+# PROMPT
 # =========================================================
 
 def build_prompt(
@@ -597,20 +674,23 @@ def build_prompt(
         for message in conversation_history[-7:]:
 
             role = message["role"]
+
             content = message["content"]
 
             history_text += (
-                f"\n{role.upper()}: {content}\n"
+                f"\n{role.upper()}: "
+                f"{content}\n"
             )
 
     prompt = f"""
 You are an AI English tutor for students.
 
-IMPORTANT RULES:
+IMPORTANT:
 
-1. You ONLY teach English.
+You ONLY teach English.
 
 You can help with:
+
 - English grammar
 - Vocabulary
 - Tenses
@@ -626,35 +706,25 @@ You can help with:
 - Sentence structure
 - English literature when it exists in the provided material
 
-If the question is about another school subject such as:
-- Mathematics
-- Physics
-- Chemistry
-- Biology
-- Computer Science
-- History
-- Geography
+If the question is about another subject,
+do not answer it.
 
-DO NOT answer it.
+Say:
 
-Say exactly:
+"I'm an English tutor, so I can only help
+with English-related questions."
 
-"I'm an English tutor, so I can only help with English-related questions."
-
-2. CENTER MATERIAL HAS PRIORITY.
+CENTER MATERIAL HAS PRIORITY.
 
 The provided files are the main source of truth.
 
 If the answer exists in the provided material,
-use that material first.
+use it first.
 
-Do not ignore the provided material in favor
-of general knowledge.
+If the files do not contain enough information,
+you may use general English knowledge.
 
-3. If the files do not contain enough information,
-you may use your general English knowledge.
-
-4. If the student says:
+If the student says:
 
 "I don't understand"
 "مش فاهم"
@@ -662,85 +732,78 @@ you may use your general English knowledge.
 "I still don't understand"
 "Explain again"
 
-DO NOT simply repeat the same explanation.
+Do NOT repeat the same explanation.
 
 Instead:
+
 - simplify the explanation
 - use an easier example
 - explain step-by-step
 - use a different method
-- Arabic can be used briefly when it helps
+- use Arabic briefly when useful
 
-5. When solving grammar questions:
+For grammar questions:
 
 Give:
-- Correct answer
-- Explanation
-- Grammar rule
-- Why the answer is correct
 
-When useful, explain why the other choices
+1. Correct answer
+2. Explanation
+3. Grammar rule
+4. Why it is correct
+
+When useful, explain why other choices
 are incorrect.
 
-6. Vocabulary:
+For vocabulary:
 
 Give:
+
 - English meaning
 - Arabic meaning when useful
 - Example sentence
 
-7. Reading questions:
+For reading:
 
-Answer based on the provided text/material
+Answer based on the provided material
 when available.
 
-8. Writing:
+For writing:
 
-Correct the student's writing and explain
-the important mistakes.
+Correct the writing and explain
+important mistakes.
 
-9. Exercises:
+For exercises:
 
-Solve step-by-step instead of only giving
-the final answer.
+Solve step-by-step.
 
-10. Keep explanations appropriate for students
-and easy to understand.
+Do not mention:
 
-11. Do not mention RAG, embeddings, prompts,
-documents retrieval, system instructions,
-or internal implementation.
+- RAG
+- embeddings
+- prompts
+- system instructions
+- internal implementation
 
-12. If the question is unclear, ask for clarification.
-
-========================
-CENTER MATERIAL
-========================
+CENTER MATERIAL:
 
 {context}
 
-========================
-RECENT CONVERSATION
-========================
+RECENT CONVERSATION:
 
 {history_text}
 
-========================
-STUDENT QUESTION
-========================
+STUDENT QUESTION:
 
 {question}
 
-========================
-ANSWER
-========================
+ANSWER:
 """
 
     return prompt
 
 
 # =========================================================
-# GENERATE ANSWER
+# GEMINI GENERATION WITH RETRY
 # =========================================================
 
 def generate_answer(
@@ -766,14 +829,57 @@ def generate_answer(
             mime_type=image_mime
         )
 
-        contents.append(image_part)
+        contents.append(
+            image_part
+        )
 
-    response = client.models.generate_content(
-        model=GENERATION_MODEL,
-        contents=contents
+    last_error = None
+
+    # Try 3 times
+    for attempt in range(3):
+
+        try:
+
+            response = client.models.generate_content(
+                model=GENERATION_MODEL,
+                contents=contents
+            )
+
+            if response.text:
+
+                return response.text
+
+            return "I couldn't generate an answer."
+
+        except Exception as e:
+
+            last_error = e
+
+            error_text = str(e)
+
+            temporary_error = (
+                "503" in error_text
+                or "UNAVAILABLE" in error_text
+                or "high demand" in error_text
+                or "temporarily" in error_text.lower()
+            )
+
+            if temporary_error and attempt < 2:
+
+                wait_time = 3 * (attempt + 1)
+
+                time.sleep(
+                    wait_time
+                )
+
+                continue
+
+            break
+
+    raise Exception(
+        "Gemini is temporarily unavailable.\n\n"
+        f"Details: {last_error}"
     )
-
-    return response.text
 
 
 # =========================================================
@@ -781,12 +887,17 @@ def generate_answer(
 # =========================================================
 
 if "logged_in" not in st.session_state:
+
     st.session_state.logged_in = False
 
+
 if "username" not in st.session_state:
+
     st.session_state.username = ""
 
+
 if "messages" not in st.session_state:
+
     st.session_state.messages = []
 
 
@@ -833,10 +944,14 @@ if not st.session_state.logged_in:
             use_container_width=True
         ):
 
-            if not login_username or not login_password:
+            if (
+                not login_username
+                or not login_password
+            ):
 
                 st.error(
-                    "Please enter username and password."
+                    "Please enter username "
+                    "and password."
                 )
 
             else:
@@ -849,6 +964,7 @@ if not st.session_state.logged_in:
                 if success:
 
                     st.session_state.logged_in = True
+
                     st.session_state.username = (
                         login_username.strip()
                     )
@@ -859,7 +975,9 @@ if not st.session_state.logged_in:
 
                 else:
 
-                    st.error(error_message)
+                    st.error(
+                        error_message
+                    )
 
     # =====================================================
     # REGISTER
@@ -867,7 +985,9 @@ if not st.session_state.logged_in:
 
     with register_tab:
 
-        st.subheader("Create Student Account")
+        st.subheader(
+            "Create Student Account"
+        )
 
         register_code = st.text_input(
             "Student Code",
@@ -897,7 +1017,6 @@ if not st.session_state.logged_in:
             use_container_width=True
         ):
 
-            # Check student code
             if register_code != STUDENT_CODE:
 
                 st.error(
@@ -925,14 +1044,16 @@ if not st.session_state.logged_in:
             elif len(register_password) < 6:
 
                 st.error(
-                    "Password must be at least 6 characters."
+                    "Password must be at least "
+                    "6 characters."
                 )
 
             else:
 
-                username = register_username.strip()
+                username = (
+                    register_username.strip()
+                )
 
-                # Check username
                 if username_exists(username):
 
                     st.error(
@@ -942,9 +1063,11 @@ if not st.session_state.logged_in:
 
                 else:
 
-                    success, error_message = create_student(
-                        username,
-                        register_password
+                    success, error_message = (
+                        create_student(
+                            username,
+                            register_password
+                        )
                     )
 
                     if success:
@@ -964,7 +1087,6 @@ if not st.session_state.logged_in:
                             "Could not create account."
                         )
 
-                        # Show real Supabase error
                         st.code(
                             error_message
                         )
@@ -973,13 +1095,14 @@ if not st.session_state.logged_in:
 
 
 # =========================================================
-# LOGGED-IN CHATBOT
+# CHATBOT
 # =========================================================
 
 st.title("📚 English AI Tutor")
 
 st.caption(
-    f"Logged in as: {st.session_state.username}"
+    f"Logged in as: "
+    f"{st.session_state.username}"
 )
 
 
@@ -1003,7 +1126,9 @@ with st.sidebar:
     ):
 
         st.session_state.logged_in = False
+
         st.session_state.username = ""
+
         st.session_state.messages = []
 
         st.rerun()
@@ -1011,12 +1136,13 @@ with st.sidebar:
     st.divider()
 
     st.info(
-        "This chatbot is specialized in English only."
+        "This chatbot is specialized "
+        "in English only."
     )
 
 
 # =========================================================
-# LOAD RAG
+# LOAD KNOWLEDGE
 # =========================================================
 
 with st.spinner(
@@ -1029,12 +1155,13 @@ with st.spinner(
 if not documents:
 
     st.warning(
-        "No English files were found in the knowledge folder."
+        "No English files were found "
+        "in the knowledge folder."
     )
 
 
 # =========================================================
-# DISPLAY CHAT HISTORY
+# CHAT HISTORY
 # =========================================================
 
 for message in st.session_state.messages:
@@ -1053,7 +1180,8 @@ for message in st.session_state.messages:
 # =========================================================
 
 uploaded_image = st.file_uploader(
-    "📷 Upload a screenshot of an English question",
+    "📷 Upload a screenshot "
+    "of an English question",
     type=[
         "png",
         "jpg",
@@ -1086,16 +1214,21 @@ if user_question or uploaded_image:
     )
 
     image_bytes = None
+
     image_mime = None
+
     extracted_question = ""
 
     # =====================================================
-    # PROCESS IMAGE
+    # READ SCREENSHOT
     # =====================================================
 
     if uploaded_image:
 
-        image_bytes = uploaded_image.getvalue()
+        image_bytes = (
+            uploaded_image.getvalue()
+        )
+
         image_mime = uploaded_image.type
 
         with st.spinner(
@@ -1110,10 +1243,13 @@ if user_question or uploaded_image:
             )
 
     # =====================================================
-    # COMBINE QUESTION
+    # COMBINE QUESTIONS
     # =====================================================
 
-    if typed_question and extracted_question:
+    if (
+        typed_question
+        and extracted_question
+    ):
 
         final_question = (
             f"{typed_question}\n\n"
@@ -1136,19 +1272,23 @@ if user_question or uploaded_image:
     if not final_question:
 
         st.error(
-            "Please type a question or upload a screenshot."
+            "Please type a question or "
+            "upload a screenshot."
         )
 
         st.stop()
 
     # =====================================================
-    # SHOW USER QUESTION
+    # SHOW USER MESSAGE
     # =====================================================
 
     with st.chat_message("user"):
 
         if typed_question:
-            st.markdown(typed_question)
+
+            st.markdown(
+                typed_question
+            )
 
         if uploaded_image:
 
@@ -1179,10 +1319,12 @@ if user_question or uploaded_image:
 
         try:
 
-            retrieved_documents = retrieve_context(
-                final_question,
-                documents,
-                TOP_K
+            retrieved_documents = (
+                retrieve_context(
+                    final_question,
+                    documents,
+                    TOP_K
+                )
             )
 
         except Exception as e:
@@ -1190,7 +1332,12 @@ if user_question or uploaded_image:
             retrieved_documents = []
 
             st.warning(
-                f"Could not search the knowledge base: {e}"
+                "Could not search the "
+                "knowledge base."
+            )
+
+            st.code(
+                str(e)
             )
 
     # =====================================================
@@ -1207,27 +1354,38 @@ if user_question or uploaded_image:
 
                 answer = generate_answer(
                     question=final_question,
-                    retrieved_documents=retrieved_documents,
-                    conversation_history=st.session_state.messages,
+                    retrieved_documents=(
+                        retrieved_documents
+                    ),
+                    conversation_history=(
+                        st.session_state.messages
+                    ),
                     image_bytes=image_bytes,
                     image_mime=image_mime
                 )
 
-                st.markdown(answer)
+                st.markdown(
+                    answer
+                )
 
             except Exception as e:
 
                 answer = (
-                    "Sorry, I couldn't generate an answer "
-                    "right now."
+                    "Sorry, Gemini is "
+                    "temporarily unavailable. "
+                    "Please try again in a moment."
                 )
 
-                st.error(answer)
+                st.error(
+                    answer
+                )
 
-                st.code(str(e))
+                st.code(
+                    str(e)
+                )
 
     # =====================================================
-    # SAVE ASSISTANT MESSAGE
+    # SAVE ANSWER
     # =====================================================
 
     st.session_state.messages.append(
