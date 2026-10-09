@@ -61,7 +61,7 @@ CORRECTIONS_FILE = "✏️ Teacher corrections"
 CORRECTION_BOOST = 0.08  # teacher-approved answers rank higher
 OCR_PAGES_PER_REQUEST = 6
 
-DAILY_LIMIT = 40  # AI requests per student per day (admins are exempt)
+DAILY_LIMIT = 20  # AI requests per student per day (admins are exempt). Raise later if needed.
 HISTORY_TURNS = 6
 
 SESSION_DAYS = 14  # stay logged in after refresh
